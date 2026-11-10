@@ -1,0 +1,20 @@
+# Ignore everything by default
+/*
+
+# Allowed root files
+!/.gitignore
+!/README.md
+!/LICENSE
+
+# Allowed directories
+!/blueprints/
+!/scripts/
+!/tools/
+
+# Ignore common junk even inside allowed directories
+.DS_Store
+*.log
+__pycache__/
+*.pyc
+secrets.yaml
+.env
