@@ -1,0 +1,195 @@
+# Motion light (restart & power-failure safe)
+#
+# Install: copy to config/blueprints/automation/custom/motion_light_robust.yaml,
+# then Developer Tools -> YAML -> Reload automations.
+#
+# Sensors: any number of motion/occupancy/presence sensors AND door/window
+# contact sensors (e.g. IKEA MYGGSPRAY, PARASOLL, MYGGBETT).
+#   * Motion sensors count as "activity" for as long as they report motion.
+#   * Door/window sensors count as activity only at the moment they open or
+#     close. A door left open does NOT keep the lights on.
+#
+# One rule: lights go on with activity and go off once there has been no
+# activity on any sensor for <Off delay>, however the lights got turned on:
+#   * Motion detected / door or window opened  -> lights ON
+#   * No activity for <Off delay>              -> lights OFF
+#   * Lights came on another way (wall switch, power restored after an
+#     outage, app, voice) and no activity for <Off delay>
+#                                              -> lights OFF
+#   * Home Assistant restarted (running timers are lost)
+#                                              -> lights OFF after <Off delay>
+#                                                 unless there is activity
+#   * Sensor unavailable (battery, Thread drop-out, power cut)
+#                                              -> treated as "no activity"
+#
+# Tip: keep each bulb's "Power-on behavior" on "On" so the wall switch still
+# works as a manual on switch.
+
+blueprint:
+  name: Motion light (restart & power-failure safe)
+  author: Herc53
+  description: >
+    Turns lights or switches on when motion is detected or a door/window opens,
+    and off after a configurable time without activity. Lights switched on any
+    other way (wall switch, power restored, app) follow the same off delay.
+    Survives Home Assistant restarts and power failures without leaving lights
+    on forever.
+  domain: automation
+  input:
+    # (input key kept as "motion_sensor" so existing automations keep working)
+    motion_sensor:
+      name: Motion and door/window sensors
+      description: >
+        One or more sensors. Motion/occupancy sensors keep the lights on while
+        they detect motion; door/window sensors turn the lights on when opened
+        and restart the off delay when opened or closed.
+      selector:
+        entity:
+          filter:
+            - domain: binary_sensor
+              device_class:
+                - occupancy
+                - motion
+                - presence
+                - door
+                - window
+                - opening
+                - garage_door
+          multiple: true
+    lights:
+      name: Lights / switches
+      description: >
+        Any lights (Matter, Zigbee, Wi-Fi, light groups...) and/or switches
+        (e.g. smart plugs driving a lamp). Select individual entities; to use a
+        whole room, create a light group helper and pick that.
+      selector:
+        entity:
+          filter:
+            - domain: light
+            - domain: switch
+          multiple: true
+    no_motion_wait:
+      name: Off delay
+      description: How long the lights stay on after the last activity.
+      default:
+        minutes: 5
+      selector:
+        duration: {}
+    brightness:
+      name: Brightness
+      description: Brightness used when a sensor turns the lights on (ignored for switches).
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+
+# restart: new activity cancels a pending post-restart wait
+mode: restart
+max_exceeded: silent
+
+variables:
+  sensors: !input motion_sensor
+  lights: !input lights
+  off_delay: !input no_motion_wait
+  light_list: "{{ [lights] if lights is string else lights }}"
+  light_entities: "{{ light_list | select('match', 'light[.]') | list }}"
+  switch_entities: "{{ light_list | select('match', 'switch[.]') | list }}"
+  off_delay_s: >
+    {% set d = off_delay %}
+    {{ (d.days | default(0)) * 86400 + (d.hours | default(0)) * 3600
+       + (d.minutes | default(0)) * 60 + (d.seconds | default(0)) }}
+
+triggers:
+  # Activity: motion detected or door/window opened -> on
+  - trigger: state
+    entity_id: !input motion_sensor
+    to: "on"
+    id: activity
+
+  # Re-check after a sensor has been in any state for the off delay:
+  #   off / unavailable -> motion ended (or sensor dropped off the network)
+  #   on                -> door/window left open
+  - trigger: state
+    entity_id: !input motion_sensor
+    to:
+      - "on"
+      - "off"
+      - "unavailable"
+    for: !input no_motion_wait
+    id: check_off
+
+  # A light has been on for the off delay (wall switch, power restored,
+  # app/voice) -> re-check.
+  - trigger: state
+    entity_id: !input lights
+    to: "on"
+    for: !input no_motion_wait
+    id: check_off
+
+  # Home Assistant started -> all "for:" timers were lost.
+  - trigger: homeassistant
+    event: start
+    id: ha_start
+
+conditions: []
+
+actions:
+  - choose:
+      # ---- Activity: turn on -----------------------------------------------
+      - conditions:
+          - condition: trigger
+            id: activity
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ light_entities | count > 0 }}"
+            then:
+              - action: light.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: "{{ light_entities }}"
+                data:
+                  brightness_pct: !input brightness
+          - if:
+              - condition: template
+                value_template: "{{ switch_entities | count > 0 }}"
+            then:
+              - action: switch.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: "{{ switch_entities }}"
+
+      # ---- Re-check: turn off if quiet for the full off delay --------------
+      # Quiet = every sensor unchanged for the off delay, and no motion sensor
+      # currently reporting motion. If activity happened more recently, nothing
+      # happens here: that sensor's own "for: <Off delay>" trigger re-checks later.
+      - conditions:
+          - condition: trigger
+            id:
+              - check_off
+              - ha_start
+        sequence:
+          # after a restart, give the full off delay first (activity cancels it)
+          - if:
+              - condition: trigger
+                id: ha_start
+            then:
+              - delay: !input no_motion_wait
+          - condition: template
+            value_template: >
+              {% set contact = ['door', 'window', 'opening', 'garage_door'] %}
+              {% set ns = namespace(quiet=true) %}
+              {% for s in expand(sensors) %}
+                {% if (now() - s.last_changed).total_seconds() < off_delay_s - 1 %}
+                  {% set ns.quiet = false %}
+                {% endif %}
+                {% if s.state == 'on' and s.attributes.get('device_class') not in contact %}
+                  {% set ns.quiet = false %}
+                {% endif %}
+              {% endfor %}
+              {{ ns.quiet }}
+          - action: homeassistant.turn_off
+            target:
+              entity_id: "{{ light_list }}"
